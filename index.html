@@ -6512,9 +6512,22 @@ async function placeGTT(sym,qty,entryPx,tpPx,slPx,exitTxn,product,resultEl,logId
               // zdCheckTrailing() takes over: cancels both fixed GTTs, locks a floor SL at +1.3%,
               // and ratchets the SL up (never down, widening as the move proves itself) to maximize ride.
               if(logId){
+                // Capture this stock's own volatility (ATR as % of price) once, at seed
+                // time — used later to size the trailing distance per-stock instead of
+                // a one-size-fits-all band. Falls back gracefully if history isn't loaded.
+                let atrPct=null;
+                try{
+                  const rows=(allStockData[sym]&&allStockData[sym].rows)||[];
+                  if(rows.length>=15){
+                    const hi=rows.map(r=>r.hi),lo=rows.map(r=>r.lo),cl=rows.map(r=>r.cl);
+                    const atrArr=calcATR(hi,lo,cl,14);
+                    const lastAtr=atrArr[atrArr.length-1];
+                    if(lastAtr&&cl[cl.length-1])atrPct=parseFloat((lastAtr/cl[cl.length-1]*100).toFixed(2));
+                  }
+                }catch(e){}
                 trailState[logId]={
                   sym, dir: exitTxn==='SELL'?'BUY':'SELL', qty, product,
-                  entry: entryPx, floor: tpPx, peak: entryPx,
+                  entry: entryPx, floor: tpPx, peak: entryPx, atrPct,
                   gttAId: String(gid), gttBId: String(gid2),
                   slGttId: null, active: false, stage: 'fixed'
                 };
@@ -6910,27 +6923,39 @@ async function checkAndCancelOCO(){
 // +1.3%. At that point this engine cancels BOTH fixed GTTs,
 // places a single floor SL GTT at +1.3% (your guaranteed
 // minimum), then ratchets that SL up — never down — every time
-// price makes a new +1% high. The trail distance WIDENS as the
-// move proves itself (1.2% near the floor, up to 3.5% on a real
-// runner) so genuine trends aren't capped or shaken out early.
+// price makes a new +0.5% high. The trail distance is now
+// VOLATILITY-ADJUSTED (sized off the stock's own ATR%, captured
+// once when trailing begins) and widens SMOOTHLY with gain — no
+// arbitrary step-jumps — so calm stocks aren't shaken out by
+// their own normal noise, volatile stocks aren't trailed too
+// tight, and genuine runners aren't capped early. Hard ceiling
+// ~3.5% so gains already made are never given back excessively.
 // Runs on each zdFetchNow() cycle (~30s when Auto is ON), using
 // the live LTP already fetched that cycle.
 // ═══════════════════════════════════════════════════════════
-/* ── Widening trail distance — tighter early, looser once the move proves itself.
-   Goal: maximize ride on real trends without giving back the early move to normal chop.
-     Gain since entry   Trail distance kept below peak
-     +1.3% to +3%   →  1.2%   (tight — still close to floor, protect early profit)
-     +3%   to +6%   →  1.8%   (medium — give the trend room to breathe)
-     +6%   to +10%  →  2.5%   (wider — real trend, don't get shaken out by noise)
-     +10%  and up   →  3.5%   (widest — let a genuine runner run)
-*/
-function trailDistanceFor(gainPct){
-  if(gainPct>=10)return 3.5;
-  if(gainPct>=6) return 2.5;
-  if(gainPct>=3) return 1.8;
-  return 1.2;
+/* ── Trail distance — volatility-adjusted + smooth (no hard band cliffs).
+   Two inputs combine instead of one:
+     1) The stock's OWN normal daily range (ATR%) — a calm stock gets a
+        tighter trail, a volatile stock gets a wider one, so neither gets
+        stopped out by its own normal noise nor given needlessly extra room.
+     2) Gain since entry — still widens gradually as the move proves itself,
+        but as a smooth multiplier curve instead of 4 discrete step bands,
+        so there's no arbitrary jump at any single price tick.
+   Falls back to a sensible default distance if ATR% isn't available
+   (e.g. order placed without a loaded CSV history for that symbol). ── */
+function trailDistanceFor(gainPct, atrPct){
+  // Base trail = ~1.1x the stock's own daily ATR%, clamped to a sane range.
+  // This is the per-stock-volatility adjustment (the main efficiency gain).
+  const base = atrPct ? Math.min(2.2, Math.max(0.8, atrPct*1.1)) : 1.5;
+  // Smooth widening multiplier as gain grows — continuous, not stepped.
+  // ~1.0x near the floor, rising toward ~1.6x by +10% and beyond, via a
+  // saturating curve (no sudden jumps at any boundary).
+  const growth = 1 + 0.6*(1 - Math.exp(-gainPct/8));
+  return parseFloat((base*growth).toFixed(2));
 }
-const TRAIL_STEP = 1.0;     // peak must rise by this many % before SL re-ratchets
+const TRAIL_STEP = 0.5;     // peak must rise by this many % before SL re-ratchets — tightened
+                             // from 1.0 so slow grinding/choppy up-moves aren't missed (catches
+                             // trends that climb in small steps rather than one clean 1%+ pop)
 
 const TRAIL_STATE_KEY='tram_trail_state';
 function saveTrailState(){try{localStorage.setItem(TRAIL_STATE_KEY,JSON.stringify(trailState))}catch(e){}}
@@ -6980,7 +7005,7 @@ async function zdCheckTrailing(){
 
       // Gain since entry decides how much room the trail gives — wider once the move proves real
       const gainPct = isBuy ? ((ltp-st.entry)/st.entry*100) : ((st.entry-ltp)/st.entry*100);
-      const trailPct = trailDistanceFor(gainPct);
+      const trailPct = trailDistanceFor(gainPct, st.atrPct);
       const candidateSl = isBuy ? parseFloat((ltp*(1-trailPct/100)).toFixed(2)) : parseFloat((ltp*(1+trailPct/100)).toFixed(2));
       const newFloor = isBuy ? Math.max(candidateSl, st.floor) : Math.min(candidateSl, st.floor);
       // Don't bother re-placing for a trivial move
